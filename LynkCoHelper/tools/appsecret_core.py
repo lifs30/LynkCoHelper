@@ -1046,11 +1046,23 @@ def _scan_apk_for_key_classes(apk_path):
         for i, (off, name) in enumerate(lst):
             prev_off = lst[i - 1][0] if i else -(1 << 60)
             next_off = lst[i + 1][0] if i + 1 < len(lst) else (1 << 60)
+            gap_before = "" if i == 0 else str(off - prev_off)
+            gap_after = "" if i + 1 == len(lst) else str(next_off - off)
+            print(f"    [hit] {d} @{off} ${name} gap_before={gap_before} "
+                  f"gap_after={gap_after}")
             # 定义区内相邻匹配间距 < 200B；孤立（两侧 1KB 内无同模式匹配）
             # 的才是业务 dex 的引用点
             if off - prev_off > 1000 and next_off - off > 1000 and name not in found_names:
                 found_names.append(name)
-    print(f"[*] 孤立引用候选：{found_names}")
+    if not found_names:
+        # 4.3.1 的 payload 里没有孤立引用点（业务 dex 引用被壳重排），
+        # 于是把定义区里出现过的全部内部类都作为候选 —— 反正调用方是
+        # 一次性给所有候选挂延迟断点，谁先初始化谁命中，多挂几个无害。
+        for _d, _off, name in hits:
+            if name not in found_names:
+                found_names.append(name)
+        print(f"[*] 无孤立引用，改用全部内部类候选：{found_names}")
+    print(f"[*] 候选：{found_names}")
     return [f"com.safe.cons.LynkCoConstants${n}" for n in found_names]
 
 
