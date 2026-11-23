@@ -1033,9 +1033,35 @@ def _scan_apk_for_key_classes(apk_path):
     return [f"com.safe.cons.LynkCoConstants${n}" for n in found]
 
 
+def _find_local_apk():
+    """找一个本机已有的领克 APK（优先环境变量指定，其次 ensure_apk 下载的
+    lynkco-latest.apk / lynkco-v*.apk）。返回路径或 None。"""
+    cands = []
+    env_apk = os.environ.get("LYNKCO_APK_PATH", "").strip()
+    if env_apk:
+        cands.append(env_apk)
+    cands.append(os.path.join(TOOLS_DIR, "lynkco-latest.apk"))
+    try:
+        cands.extend(sorted(glob.glob(os.path.join(TOOLS_DIR, "lynkco-v*.apk"))))
+        cands.extend(sorted(glob.glob(os.path.join(TOOLS_DIR, "*.apk"))))
+    except Exception:
+        pass
+    seen = set()
+    for p in cands:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 50 * 1048576:
+                return p
+        except OSError:
+            continue
+    return None
+
+
 def auto_detect_candidates():
-    """从设备已安装的领克 App 拉取 APK 自动定位密钥常量类，结果按版本号
-    缓存到工具目录（同版本只需拉一次）。失败返回 []，由调用方提示退出。"""
+    """定位密钥常量类：优先扫描本机已下载的 APK（ensure_apk 装的同一份），
+    找不到才从设备拉取。结果按版本号缓存，同版本只扫一次。"""
     env_list = os.environ.get("LYNKCO_KEY_CLASSES", "").strip()
     if env_list:
         cands = [c.strip() for c in env_list.replace("\n", ",").split(",") if c.strip()]
@@ -1049,40 +1075,38 @@ def auto_detect_candidates():
         if os.path.exists(cache):
             with open(cache) as f:
                 return [ln.strip() for ln in f if ln.strip()]
+
+        # 首选：本机 APK（CI 里 ensure_apk 刚下载/安装的就是这一份，免去
+        # 从设备 pull 285MB；pull 需要 adb root，而 root 会重启 adbd 把
+        # 正在进行的 jdb 会话打断，实测直接失败）。
+        local = _find_local_apk()
+        if local:
+            print(f"[*] 复用本机 APK 定位密钥常量类：{local} "
+                  f"({os.path.getsize(local) / 1048576:.1f} MB)")
+            cands = _scan_apk_for_key_classes(local)
+            print(f"[*] APK 扫描命中 {len(cands)} 个候选类")
+            if cands:
+                os.makedirs(TOOLS_DIR, exist_ok=True)
+                with open(cache, "w") as f:
+                    f.write("\n".join(cands) + "\n")
+            return cands
+
         base = next((ln.split(":", 1)[1].strip()
                      for ln in adb("shell", "pm", "path", APP).splitlines()
                      if ln.strip()), "")
         if not base:
-            print("[!] pm path 未返回 APK 路径，无法拉取")
+            print("[!] pm path 未返回 APK 路径，且本机也没有可复用 APK")
             return []
         os.makedirs(TOOLS_DIR, exist_ok=True)
         dest = os.path.join(TOOLS_DIR, f"base-v{ver}.apk")
-        print(f"[*] 拉取设备上的 APK 自动定位密钥常量类（v{ver}，约 285MB，"
-              f"同版本仅此一次）...")
+        print(f"[*] 本机无 APK，改为从设备拉取（v{ver}，约 285MB）...")
         print(f"[*] 设备内 APK 路径：{base}")
-        # /data/app 下的 base.apk 只有 root/shell 可读，adb pull 默认以 shell
-        # 身份运行会 Permission denied，必须先 adb root 让 adbd 以 root 跑。
-        try:
-            subprocess.run([ADB, "root"], capture_output=True, text=True, timeout=90)
-            subprocess.run([ADB, "wait-for-device"], capture_output=True, text=True, timeout=120)
-            time.sleep(2)
-            print(f"[*] adb 身份：{adb('shell', 'id').strip()}")
-        except Exception as e:
-            print(f"[.] adb root 未成功（继续直连 pull）：{e}")
         r = subprocess.run([ADB, "pull", base, dest],
                            capture_output=True, text=True)
         print(f"[*] adb pull rc={r.returncode} out={r.stdout.strip()[-200:]!r} "
               f"err={r.stderr.strip()[-300:]!r}")
         if r.returncode != 0 or not os.path.exists(dest):
-            tmp = "/sdcard/lynkco-base.apk"
-            c = subprocess.run([ADB, "shell", "cp", base, tmp],
-                               capture_output=True, text=True)
-            print(f"[*] 兜底 cp 到 sdcard rc={c.returncode} err={c.stderr.strip()[-200:]!r}")
-            r = subprocess.run([ADB, "pull", tmp, dest],
-                               capture_output=True, text=True)
-            print(f"[*] 兜底 pull rc={r.returncode} err={r.stderr.strip()[-200:]!r}")
-            if r.returncode != 0 or not os.path.exists(dest):
-                return []
+            return []
         print(f"[*] 已拉取 APK：{os.path.getsize(dest) / 1048576:.1f} MB")
         cands = _scan_apk_for_key_classes(dest)
         print(f"[*] APK 扫描命中 {len(cands)} 个候选类")
