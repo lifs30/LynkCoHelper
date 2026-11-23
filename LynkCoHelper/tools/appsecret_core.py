@@ -1004,33 +1004,54 @@ def run_once():
 
 
 def _scan_apk_for_key_classes(apk_path):
-    """扫描 APK 内 classes.dex 的明文字符串区，定位业务 dex 孤立引用的
+    """扫描 APK 内所有 dex 的明文字符串区，定位业务 dex 孤立引用的
     密钥常量类（LynkCoConstants$X）。
 
-    加固壳把真实 dex 的字符串表明文存于 classes.dex 尾部 payload：定义区
-    里全部内部类名连续出现（相邻匹配间距约 35B）；而业务 dex 只会孤立
-    引用密钥类一处（相邻无同模式匹配）。后续版本内部类名再偏移也能自动
-    跟踪，无需改代码。"""
+    加固壳把真实 dex 的字符串表明文存于某段 payload：定义区里全部内部
+    类名连续出现（相邻匹配间距约 35B）；而业务 dex 只会孤立引用密钥类
+    一处（相邻无同模式匹配）。4.3.1 起 dex 可能拆到 classes2/3.dex，
+    所以逐 dex 扫描并分别判定孤立性。"""
     import zipfile
-    try:
-        with zipfile.ZipFile(apk_path) as z:
-            data = z.read("classes.dex")
-    except Exception:
-        return []
-    # 仅匹配小写字母开头的短混淆名（$a~$zz）；ModuleEvent/WeexUrl 等带
-    # 大写开头的具名内部类在业务 dex 中与密钥类相邻出现，必须排除，否则
-    # 会破坏孤立性判定
     pat = re.compile(rb"Lcom/safe/cons/LynkCoConstants\$([a-z]{1,3});")
-    hits = [(m.start(), m.group(1).decode()) for m in pat.finditer(data)]
-    found = []
-    for i, (off, name) in enumerate(hits):
-        prev_off = hits[i - 1][0] if i > 0 else -(1 << 60)
-        next_off = hits[i + 1][0] if i + 1 < len(hits) else 1 << 60
-        # 定义区内相邻匹配间距 < 200B；孤立（两侧 1KB 内无同模式匹配）
-        # 的才是业务 dex 的引用点
-        if off - prev_off > 1000 and next_off - off > 1000 and name not in found:
-            found.append(name)
-    return [f"com.safe.cons.LynkCoConstants${n}" for n in found]
+    any_pat = re.compile(rb"LynkCoConstants")
+    try:
+        z = zipfile.ZipFile(apk_path)
+    except Exception as e:
+        print(f"[.] 打开 APK 失败：{e}")
+        return []
+    hits = []
+    with z:
+        dexes = [n for n in z.namelist() if re.search(r"\.dex$", n)]
+        print(f"[*] APK 内含 {len(dexes)} 个 dex：{dexes[:10]}"
+              f"{' ...' if len(dexes) > 10 else ''}")
+        for n in dexes:
+            try:
+                data = z.read(n)
+            except Exception as e:
+                print(f"    [.] 读取 {n} 失败：{e}")
+                continue
+            found = pat.findall(data)
+            if found or any_pat.search(data):
+                print(f"    [{n}] {len(data) / 1048576:.1f}MB：完整类名 "
+                      f"{len(found)} 个，裸字符串 "
+                      f"{len(any_pat.findall(data))} 个")
+            for m in pat.finditer(data):
+                hits.append((n, m.start(), m.group(1).decode()))
+    by_dex = {}
+    for d, off, name in hits:
+        by_dex.setdefault(d, []).append((off, name))
+    found_names = []
+    for d, lst in by_dex.items():
+        lst.sort()
+        for i, (off, name) in enumerate(lst):
+            prev_off = lst[i - 1][0] if i else -(1 << 60)
+            next_off = lst[i + 1][0] if i + 1 < len(lst) else (1 << 60)
+            # 定义区内相邻匹配间距 < 200B；孤立（两侧 1KB 内无同模式匹配）
+            # 的才是业务 dex 的引用点
+            if off - prev_off > 1000 and next_off - off > 1000 and name not in found_names:
+                found_names.append(name)
+    print(f"[*] 孤立引用候选：{found_names}")
+    return [f"com.safe.cons.LynkCoConstants${n}" for n in found_names]
 
 
 def _find_local_apk():
