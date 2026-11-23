@@ -1036,6 +1036,11 @@ def _scan_apk_for_key_classes(apk_path):
 def auto_detect_candidates():
     """从设备已安装的领克 App 拉取 APK 自动定位密钥常量类，结果按版本号
     缓存到工具目录（同版本只需拉一次）。失败返回 []，由调用方提示退出。"""
+    env_list = os.environ.get("LYNKCO_KEY_CLASSES", "").strip()
+    if env_list:
+        cands = [c.strip() for c in env_list.replace("\n", ",").split(",") if c.strip()]
+        print(f"[*] 使用环境变量指定的密钥常量类：{', '.join(cands)}")
+        return cands
     try:
         info = adb("shell", "dumpsys", "package", APP)
         m = re.search(r"versionName=([\w.\-]+)", info)
@@ -1048,16 +1053,39 @@ def auto_detect_candidates():
                      for ln in adb("shell", "pm", "path", APP).splitlines()
                      if ln.strip()), "")
         if not base:
+            print("[!] pm path 未返回 APK 路径，无法拉取")
             return []
         os.makedirs(TOOLS_DIR, exist_ok=True)
         dest = os.path.join(TOOLS_DIR, f"base-v{ver}.apk")
         print(f"[*] 拉取设备上的 APK 自动定位密钥常量类（v{ver}，约 285MB，"
               f"同版本仅此一次）...")
+        print(f"[*] 设备内 APK 路径：{base}")
+        # /data/app 下的 base.apk 只有 root/shell 可读，adb pull 默认以 shell
+        # 身份运行会 Permission denied，必须先 adb root 让 adbd 以 root 跑。
+        try:
+            subprocess.run([ADB, "root"], capture_output=True, text=True, timeout=90)
+            subprocess.run([ADB, "wait-for-device"], capture_output=True, text=True, timeout=120)
+            time.sleep(2)
+            print(f"[*] adb 身份：{adb('shell', 'id').strip()}")
+        except Exception as e:
+            print(f"[.] adb root 未成功（继续直连 pull）：{e}")
         r = subprocess.run([ADB, "pull", base, dest],
                            capture_output=True, text=True)
+        print(f"[*] adb pull rc={r.returncode} out={r.stdout.strip()[-200:]!r} "
+              f"err={r.stderr.strip()[-300:]!r}")
         if r.returncode != 0 or not os.path.exists(dest):
-            return []
+            tmp = "/sdcard/lynkco-base.apk"
+            c = subprocess.run([ADB, "shell", "cp", base, tmp],
+                               capture_output=True, text=True)
+            print(f"[*] 兜底 cp 到 sdcard rc={c.returncode} err={c.stderr.strip()[-200:]!r}")
+            r = subprocess.run([ADB, "pull", tmp, dest],
+                               capture_output=True, text=True)
+            print(f"[*] 兜底 pull rc={r.returncode} err={r.stderr.strip()[-200:]!r}")
+            if r.returncode != 0 or not os.path.exists(dest):
+                return []
+        print(f"[*] 已拉取 APK：{os.path.getsize(dest) / 1048576:.1f} MB")
         cands = _scan_apk_for_key_classes(dest)
+        print(f"[*] APK 扫描命中 {len(cands)} 个候选类")
         try:
             os.remove(dest)
         except OSError:
